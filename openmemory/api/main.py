@@ -1,4 +1,4 @@
-from sqlalchemy import textimport datetime
+import datetime
 import os
 import logging
 from pathlib import Path
@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi_pagination import add_pagination
+from sqlalchemy import text
 
 from app.database import engine, Base, SessionLocal, get_db
 from app.mcp_server import setup_mcp_server
