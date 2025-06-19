@@ -9,6 +9,9 @@ When running inside a Docker container and using Ollama as the LLM or embedder p
 the system automatically detects the Docker environment and adjusts localhost URLs
 to properly reach the host machine where Ollama is running.
 
+Qdrant Cloud Configuration:
+Supports both local Qdrant instances and Qdrant Cloud with automatic API key handling.
+
 Supported Docker host resolution (in order of preference):
 1. OLLAMA_HOST environment variable (if set)
 2. host.docker.internal (Docker Desktop for Mac/Windows)
@@ -127,6 +130,82 @@ def _fix_ollama_urls(config_section):
     return config_section
 
 
+def _get_qdrant_config():
+    """
+    Get Qdrant configuration based on environment variables.
+    Supports both local Qdrant and Qdrant Cloud.
+    """
+    qdrant_url = os.environ.get('QDRANT_URL', '')
+    qdrant_api_key = os.environ.get('QDRANT_API_KEY', '')
+    qdrant_collection = os.environ.get('QDRANT_COLLECTION_NAME', 'openmemory')
+    
+    # Check if Qdrant is disabled
+    if qdrant_url.lower() in ['disabled', 'false', 'off']:
+        print("⚠️ Qdrant disabled via environment variable")
+        return None
+    
+    # Qdrant Cloud configuration
+    if qdrant_url and qdrant_api_key:
+        # Parse cloud URL
+        if qdrant_url.startswith(('http://', 'https://')):
+            # Remove protocol and extract host/port
+            url_without_protocol = qdrant_url.replace('https://', '').replace('http://', '')
+            if ':' in url_without_protocol:
+                host, port = url_without_protocol.split(':', 1)
+                port = int(port)
+            else:
+                host = url_without_protocol
+                port = 443  # Default HTTPS port for Qdrant Cloud
+        else:
+            host = qdrant_url
+            port = 443
+        
+        use_https = qdrant_url.startswith('https://') or port == 443
+        
+        config = {
+            "host": host,
+            "port": port,
+            "api_key": qdrant_api_key,
+            "https": use_https,
+            "collection_name": qdrant_collection,
+            "timeout": 30,
+            "prefer_grpc": False,  # Use HTTP API for cloud
+        }
+        
+        print(f"🔗 Configured Qdrant Cloud: {host}:{port} (HTTPS: {use_https})")
+        return config
+    
+    # Local Qdrant configuration (fallback)
+    elif qdrant_url:
+        print(f"🔗 Configured local Qdrant: {qdrant_url}")
+        if qdrant_url.startswith(('http://', 'https://')):
+            url_without_protocol = qdrant_url.replace('https://', '').replace('http://', '')
+            if ':' in url_without_protocol:
+                host, port = url_without_protocol.split(':', 1)
+                port = int(port)
+            else:
+                host = url_without_protocol
+                port = 6333
+        else:
+            host = qdrant_url
+            port = 6333
+            
+        return {
+            "host": host,
+            "port": port,
+            "collection_name": qdrant_collection,
+        }
+    
+    # Default local configuration
+    else:
+        print("🔗 Using default local Qdrant configuration")
+        return {
+            "collection_name": qdrant_collection,
+            "host": "mem0_store",
+            "port": 6333,
+        }
+
+
 def reset_memory_client():
     """Reset the global memory client to force reinitialization with new config."""
     global _memory_client, _config_hash
@@ -136,15 +215,11 @@ def reset_memory_client():
 
 def get_default_memory_config():
     """Get default memory client configuration with sensible defaults."""
-    return {
-        "vector_store": {
-            "provider": "qdrant",
-            "config": {
-                "collection_name": "openmemory",
-                "host": "mem0_store",
-                "port": 6333,
-            }
-        },
+    
+    # Get Qdrant configuration
+    qdrant_config = _get_qdrant_config()
+    
+    base_config = {
         "llm": {
             "provider": "openai",
             "config": {
@@ -163,6 +238,18 @@ def get_default_memory_config():
         },
         "version": "v1.1"
     }
+    
+    # Add vector store config if Qdrant is available
+    if qdrant_config:
+        base_config["vector_store"] = {
+            "provider": "qdrant",
+            "config": qdrant_config
+        }
+        print("✅ Vector store (Qdrant) included in configuration")
+    else:
+        print("⚠️ No vector store configured - running in basic mode")
+    
+    return base_config
 
 
 def _parse_environment_variables(config_dict):
@@ -188,6 +275,45 @@ def _parse_environment_variables(config_dict):
                 parsed_config[key] = value
         return parsed_config
     return config_dict
+
+
+def _test_qdrant_connection():
+    """Test Qdrant connection to verify it's working."""
+    qdrant_config = _get_qdrant_config()
+    
+    if not qdrant_config:
+        return False
+    
+    try:
+        import requests
+        
+        host = qdrant_config.get("host", "localhost")
+        port = qdrant_config.get("port", 6333)
+        api_key = qdrant_config.get("api_key")
+        use_https = qdrant_config.get("https", False)
+        
+        protocol = "https" if use_https else "http"
+        url = f"{protocol}://{host}:{port}/collections"
+        
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["api-key"] = api_key
+        
+        print(f"🔍 Testing Qdrant connection: {url}")
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code in [200, 404]:  # 404 is OK (no collections yet)
+            print(f"✅ Qdrant connection successful (status: {response.status_code})")
+            return True
+        else:
+            print(f"❌ Qdrant connection failed (status: {response.status_code})")
+            print(f"Response: {response.text}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Qdrant connection test failed: {e}")
+        return False
 
 
 def get_memory_client(custom_instructions: str = None):
@@ -263,6 +389,12 @@ def get_memory_client(custom_instructions: str = None):
         print("Parsing environment variables in final config...")
         config = _parse_environment_variables(config)
 
+        # Test Qdrant connection if vector store is configured
+        if "vector_store" in config:
+            if not _test_qdrant_connection():
+                print("⚠️ Qdrant connection failed, removing vector store from config")
+                config.pop("vector_store", None)
+
         # Check if config has changed by comparing hashes
         current_config_hash = _get_config_hash(config)
         
@@ -272,7 +404,13 @@ def get_memory_client(custom_instructions: str = None):
             try:
                 _memory_client = Memory.from_config(config_dict=config)
                 _config_hash = current_config_hash
-                print("Memory client initialized successfully")
+                
+                # Log the configuration mode
+                if "vector_store" in config:
+                    print("✅ Memory client initialized with vector store (Qdrant)")
+                else:
+                    print("✅ Memory client initialized in basic mode (no vector store)")
+                    
             except Exception as init_error:
                 print(f"Warning: Failed to initialize memory client: {init_error}")
                 print("Server will continue running with limited memory functionality")
