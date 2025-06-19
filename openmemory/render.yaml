@@ -1,0 +1,26 @@
+databases:
+  - name: openmemory-postgres
+    databaseName: openmemory
+    user: openmemory_user
+    plan: starter
+
+services:
+  - type: web
+    name: openmemory-mcp
+    env: docker
+    dockerContext: .
+    dockerfilePath: ./Dockerfile.render
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: USER
+        value: "default-user"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: openmemory-postgres
+          property: connectionString
+      - key: VECTOR_STORE_PROVIDER
+        value: "pgvector"
+      - key: PORT
+        value: "8765"
+    healthCheckPath: /health
