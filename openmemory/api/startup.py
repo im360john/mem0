@@ -1,79 +1,166 @@
 #!/usr/bin/env python3
 """
-Database setup and initialization script for OpenMemory MCP
+Simple database setup script for OpenMemory MCP
 """
 
 import os
 import sys
 import logging
-from sqlalchemy import create_engine, text, inspect
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import create_engine, text
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-def setup_database():
-    """Setup database tables and handle migrations"""
+def main():
+    """Main setup function"""
+    logger.info("🚀 Starting OpenMemory database setup...")
     
     # Get database URL
     database_url = os.getenv('DATABASE_URL')
     if not database_url:
         logger.error("❌ DATABASE_URL environment variable not found")
-        return False
+        sys.exit(1)
     
     logger.info(f"🔗 Connecting to database...")
     
     try:
-        # Create engine
+        # Create engine and test connection
         engine = create_engine(database_url)
-        
-        # Test connection
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         logger.info("✅ Database connection successful")
         
-        # Import models (after successful connection)
-        try:
-            from app.database import Base
-            from app.models import *
-            logger.info("✅ Models imported successfully")
-        except ImportError as e:
-            logger.error(f"❌ Failed to import models: {e}")
-            return False
+        # Setup PostgreSQL extensions if needed
+        if 'postgresql' in database_url:
+            setup_postgres_extensions(engine)
         
-        # Check if tables exist
-        inspector = inspect(engine)
-        existing_tables = inspector.get_table_names()
-        logger.info(f"📋 Found {len(existing_tables)} existing tables")
+        # Try to import and create tables
+        logger.info("🔨 Setting up database tables...")
+        import_and_create_tables(engine)
         
-        # Create tables
-        logger.info("🔨 Creating database tables...")
+        # Setup Alembic tracking
+        setup_alembic_tracking(engine)
+        
+        logger.info("🎉 Database setup completed successfully!")
+        
+    except Exception as e:
+        logger.error(f"❌ Database setup failed: {e}")
+        sys.exit(1)
+
+def setup_postgres_extensions(engine):
+    """Setup PostgreSQL extensions"""
+    try:
+        with engine.connect() as conn:
+            extensions = [
+                'CREATE EXTENSION IF NOT EXISTS "uuid-ossp"',
+                'CREATE EXTENSION IF NOT EXISTS pg_trgm', 
+                'CREATE EXTENSION IF NOT EXISTS btree_gin'
+            ]
+            
+            for ext_sql in extensions:
+                try:
+                    conn.execute(text(ext_sql))
+                except Exception as e:
+                    logger.warning(f"⚠️ Extension note: {e}")
+            
+            conn.commit()
+        logger.info("✅ PostgreSQL extensions setup")
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Extensions setup warning: {e}")
+
+def import_and_create_tables(engine):
+    """Import models and create tables"""
+    try:
+        # Add the current directory to Python path
+        sys.path.insert(0, os.getcwd())
+        
+        # Import database and models
+        from app.database import Base
+        import app.models  # This imports all models and registers them with Base
+        
+        # Create all tables
         Base.metadata.create_all(bind=engine)
         logger.info("✅ Database tables created successfully")
         
-        # Setup Alembic version tracking
-        setup_alembic_version(engine)
+    except ImportError as e:
+        logger.error(f"❌ Failed to import models: {e}")
+        logger.info("🔄 Trying alternative import...")
         
-        # Verify table creation
-        inspector = inspect(engine)
-        new_tables = inspector.get_table_names()
-        logger.info(f"📊 Total tables after setup: {len(new_tables)}")
-        
-        return True
-        
-    except SQLAlchemyError as e:
-        logger.error(f"❌ Database error: {e}")
-        return False
+        # Alternative: try direct SQL creation
+        create_tables_with_sql(engine)
+    
     except Exception as e:
-        logger.error(f"❌ Unexpected error: {e}")
-        return False
+        logger.error(f"❌ Table creation failed: {e}")
+        raise
 
-def setup_alembic_version(engine):
+def create_tables_with_sql(engine):
+    """Fallback: create tables with direct SQL"""
+    logger.info("🔄 Using fallback SQL table creation...")
+    
+    # Basic table creation SQL (simplified)
+    tables_sql = [
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id VARCHAR(255) NOT NULL UNIQUE,
+            name VARCHAR(255),
+            email VARCHAR(255) UNIQUE,
+            metadata JSONB DEFAULT '{}',
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS apps (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            name VARCHAR(255) NOT NULL,
+            description TEXT,
+            metadata JSONB DEFAULT '{}',
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(owner_id, name)
+        )
+        """,
+        """
+        CREATE TYPE IF NOT EXISTS memory_state_enum AS ENUM ('active', 'paused', 'archived', 'deleted')
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS memories (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            app_id UUID NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+            content TEXT NOT NULL,
+            vector TEXT,
+            metadata JSONB DEFAULT '{}',
+            state memory_state_enum DEFAULT 'active',
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            archived_at TIMESTAMPTZ,
+            deleted_at TIMESTAMPTZ
+        )
+        """
+    ]
+    
+    try:
+        with engine.connect() as conn:
+            for sql in tables_sql:
+                conn.execute(text(sql))
+            conn.commit()
+        logger.info("✅ Basic tables created with SQL")
+        
+    except Exception as e:
+        logger.error(f"❌ SQL table creation failed: {e}")
+        raise
+
+def setup_alembic_tracking(engine):
     """Setup Alembic version tracking"""
     try:
         with engine.connect() as conn:
-            # Create alembic_version table if it doesn't exist
+            # Create alembic_version table
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS alembic_version (
                     version_num VARCHAR(32) NOT NULL,
@@ -81,7 +168,7 @@ def setup_alembic_version(engine):
                 )
             """))
             
-            # Insert current migration version
+            # Insert current version
             conn.execute(text("""
                 INSERT INTO alembic_version (version_num) 
                 VALUES ('0b53c747049a') 
@@ -89,88 +176,10 @@ def setup_alembic_version(engine):
             """))
             
             conn.commit()
-        logger.info("✅ Alembic version tracking setup complete")
+        logger.info("✅ Alembic tracking setup")
         
     except Exception as e:
-        logger.warning(f"⚠️ Alembic version setup failed: {e}")
-
-def setup_extensions():
-    """Setup PostgreSQL extensions"""
-    database_url = os.getenv('DATABASE_URL', '')
-    
-    # Only run for PostgreSQL
-    if 'postgresql' not in database_url:
-        logger.info("ℹ️ Not PostgreSQL, skipping extensions")
-        return
-    
-    try:
-        engine = create_engine(database_url)
-        with engine.connect() as conn:
-            # Enable extensions
-            extensions = [
-                'CREATE EXTENSION IF NOT EXISTS "uuid-ossp"',
-                'CREATE EXTENSION IF NOT EXISTS pg_trgm',
-                'CREATE EXTENSION IF NOT EXISTS btree_gin'
-            ]
-            
-            for ext_sql in extensions:
-                try:
-                    conn.execute(text(ext_sql))
-                    logger.info(f"✅ Extension enabled: {ext_sql.split()[-1]}")
-                except Exception as e:
-                    logger.warning(f"⚠️ Extension warning: {e}")
-            
-            conn.commit()
-        logger.info("✅ PostgreSQL extensions setup complete")
-        
-    except Exception as e:
-        logger.warning(f"⚠️ Extensions setup failed: {e}")
-
-def run_alembic_upgrade():
-    """Try to run Alembic upgrade"""
-    try:
-        logger.info("🔄 Attempting Alembic upgrade...")
-        import subprocess
-        result = subprocess.run(
-            ['python', '-m', 'alembic', 'upgrade', 'head'],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        
-        if result.returncode == 0:
-            logger.info("✅ Alembic upgrade successful")
-            return True
-        else:
-            logger.warning(f"⚠️ Alembic upgrade failed: {result.stderr}")
-            return False
-            
-    except subprocess.TimeoutExpired:
-        logger.warning("⚠️ Alembic upgrade timed out")
-        return False
-    except Exception as e:
-        logger.warning(f"⚠️ Alembic upgrade error: {e}")
-        return False
-
-def main():
-    """Main setup function"""
-    logger.info("🚀 Starting OpenMemory database setup...")
-    
-    # Step 1: Setup PostgreSQL extensions
-    setup_extensions()
-    
-    # Step 2: Try Alembic first
-    alembic_success = run_alembic_upgrade()
-    
-    # Step 3: If Alembic fails, use direct table creation
-    if not alembic_success:
-        logger.info("🔄 Falling back to direct table creation...")
-        success = setup_database()
-        if not success:
-            logger.error("❌ Database setup failed")
-            sys.exit(1)
-    
-    logger.info("🎉 Database setup completed successfully!")
+        logger.warning(f"⚠️ Alembic setup warning: {e}")
 
 if __name__ == "__main__":
     main()
