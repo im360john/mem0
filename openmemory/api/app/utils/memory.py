@@ -134,6 +134,7 @@ def _get_qdrant_config():
     """
     Get Qdrant configuration based on environment variables.
     Supports both local Qdrant and Qdrant Cloud.
+    Only includes fields allowed by Mem0's MemoryConfig.
     """
     qdrant_url = os.environ.get('QDRANT_URL', '')
     qdrant_api_key = os.environ.get('QDRANT_API_KEY', '')
@@ -146,63 +147,51 @@ def _get_qdrant_config():
     
     # Qdrant Cloud configuration
     if qdrant_url and qdrant_api_key:
-        # Parse cloud URL
-        if qdrant_url.startswith(('http://', 'https://')):
-            # Remove protocol and extract host/port
-            url_without_protocol = qdrant_url.replace('https://', '').replace('http://', '')
-            if ':' in url_without_protocol:
-                host, port = url_without_protocol.split(':', 1)
-                port = int(port)
-            else:
-                host = url_without_protocol
-                port = 443  # Default HTTPS port for Qdrant Cloud
-        else:
-            host = qdrant_url
-            port = 443
-        
-        use_https = qdrant_url.startswith('https://') or port == 443
+        # For Qdrant Cloud, we can use the full URL directly
+        if not qdrant_url.startswith(('http://', 'https://')):
+            # Add https:// if not present for cloud URLs
+            qdrant_url = f"https://{qdrant_url}"
         
         config = {
-            "host": host,
-            "port": port,
+            "url": qdrant_url,
             "api_key": qdrant_api_key,
-            "https": use_https,
             "collection_name": qdrant_collection,
-            "timeout": 30,
-            "prefer_grpc": False,  # Use HTTP API for cloud
         }
         
-        print(f"🔗 Configured Qdrant Cloud: {host}:{port} (HTTPS: {use_https})")
+        print(f"🔗 Configured Qdrant Cloud: {qdrant_url}")
         return config
     
     # Local Qdrant configuration (fallback)
     elif qdrant_url:
         print(f"🔗 Configured local Qdrant: {qdrant_url}")
         if qdrant_url.startswith(('http://', 'https://')):
-            url_without_protocol = qdrant_url.replace('https://', '').replace('http://', '')
-            if ':' in url_without_protocol:
-                host, port = url_without_protocol.split(':', 1)
+            # Use URL format for local with protocol
+            return {
+                "url": qdrant_url,
+                "collection_name": qdrant_collection,
+            }
+        else:
+            # Use host:port format for local without protocol
+            if ':' in qdrant_url:
+                host, port = qdrant_url.split(':', 1)
                 port = int(port)
             else:
-                host = url_without_protocol
+                host = qdrant_url
                 port = 6333
-        else:
-            host = qdrant_url
-            port = 6333
-            
-        return {
-            "host": host,
-            "port": port,
-            "collection_name": qdrant_collection,
-        }
+                
+            return {
+                "host": host,
+                "port": port,
+                "collection_name": qdrant_collection,
+            }
     
     # Default local configuration
     else:
         print("🔗 Using default local Qdrant configuration")
         return {
-            "collection_name": qdrant_collection,
             "host": "mem0_store",
             "port": 6333,
+            "collection_name": qdrant_collection,
         }
 
 
@@ -287,21 +276,28 @@ def _test_qdrant_connection():
     try:
         import requests
         
-        host = qdrant_config.get("host", "localhost")
-        port = qdrant_config.get("port", 6333)
-        api_key = qdrant_config.get("api_key")
-        use_https = qdrant_config.get("https", False)
+        # Build URL based on config format
+        if "url" in qdrant_config:
+            # URL-based config (Qdrant Cloud)
+            base_url = qdrant_config["url"]
+            if not base_url.endswith('/'):
+                base_url += '/'
+            test_url = f"{base_url}collections"
+        else:
+            # Host/port-based config (local)
+            host = qdrant_config.get("host", "localhost")
+            port = qdrant_config.get("port", 6333)
+            test_url = f"http://{host}:{port}/collections"
         
-        protocol = "https" if use_https else "http"
-        url = f"{protocol}://{host}:{port}/collections"
+        api_key = qdrant_config.get("api_key")
         
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["api-key"] = api_key
         
-        print(f"🔍 Testing Qdrant connection: {url}")
+        print(f"🔍 Testing Qdrant connection: {test_url}")
         
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(test_url, headers=headers, timeout=10)
         
         if response.status_code in [200, 404]:  # 404 is OK (no collections yet)
             print(f"✅ Qdrant connection successful (status: {response.status_code})")
