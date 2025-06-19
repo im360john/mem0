@@ -19,7 +19,7 @@ import logging
 import json
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
-from app.utils.memory import get_memory_client
+from app.memory import get_memory_client
 from fastapi import FastAPI, Request
 from fastapi.routing import APIRouter
 import contextvars
