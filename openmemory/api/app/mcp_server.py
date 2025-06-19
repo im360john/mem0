@@ -19,7 +19,7 @@ import logging
 import json
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
-from app.memory import get_memory_client
+from app.utils.memory import get_memory_client
 from fastapi import FastAPI, Request
 from fastapi.routing import APIRouter
 import contextvars
@@ -50,7 +50,7 @@ def get_memory_client_safe():
         client = get_memory_client()
         if client:
             # Ensure indexes exist after getting client
-            from app.memory import ensure_indexes_after_add
+            from app.utils.memory import ensure_indexes_after_add
             ensure_indexes_after_add()
         return client
     except Exception as e:
@@ -342,7 +342,14 @@ async def search_memory(query: str) -> str:
                 })
                 
             except Exception as search_error:
-                logger.warning(f"⚠️ Memory client search failed: {search_error}")
+                # If there's an index issue, try to ensure indexes
+                if "Index required" in str(search_error):
+                    try:
+                        from app.utils.memory import _ensure_qdrant_indexes
+                        _ensure_qdrant_indexes()
+                        logger.info("✅ Indexes created, retrying search...")
+                    except Exception as index_error:
+                        logger.warning(f"Could not create indexes: {index_error}")
                 
                 # Fallback to manual Qdrant search (your original code)
                 if hasattr(memory_client, 'vector_store') and hasattr(memory_client, 'embedding_model'):
