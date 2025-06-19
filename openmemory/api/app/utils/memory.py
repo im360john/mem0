@@ -1,33 +1,8 @@
 """
-Memory client utilities for OpenMemory.
+Memory client utilities for OpenMemory with enhanced Qdrant index management.
 
 This module provides functionality to initialize and manage the Mem0 memory client
-with automatic configuration management and Docker environment support.
-
-Docker Ollama Configuration:
-When running inside a Docker container and using Ollama as the LLM or embedder provider,
-the system automatically detects the Docker environment and adjusts localhost URLs
-to properly reach the host machine where Ollama is running.
-
-Qdrant Cloud Configuration:
-Supports both local Qdrant instances and Qdrant Cloud with automatic API key handling.
-
-Supported Docker host resolution (in order of preference):
-1. OLLAMA_HOST environment variable (if set)
-2. host.docker.internal (Docker Desktop for Mac/Windows)
-3. Docker bridge gateway IP (typically 172.17.0.1 on Linux)
-4. Fallback to 172.17.0.1
-
-Example configuration that will be automatically adjusted:
-{
-    "llm": {
-        "provider": "ollama",
-        "config": {
-            "model": "llama3.1:latest",
-            "ollama_base_url": "http://localhost:11434"  # Auto-adjusted in Docker
-        }
-    }
-}
+with automatic configuration management, Docker environment support, and Qdrant index management.
 """
 
 import os
@@ -35,14 +10,18 @@ import json
 import hashlib
 import socket
 import platform
+import logging
 
 from mem0 import Memory
 from app.database import SessionLocal
 from app.models import Config as ConfigModel
 
+logger = logging.getLogger(__name__)
 
 _memory_client = None
 _config_hash = None
+_qdrant_client = None
+_indexes_created = False
 
 
 def _get_config_hash(config_dict):
@@ -195,11 +174,108 @@ def _get_qdrant_config():
         }
 
 
+def _setup_qdrant_client():
+    """Setup direct Qdrant client for index management"""
+    global _qdrant_client
+    
+    try:
+        from qdrant_client import QdrantClient
+        
+        config = _get_qdrant_config()
+        if not config:
+            return False
+        
+        if "url" in config:
+            # URL-based config (Qdrant Cloud)
+            _qdrant_client = QdrantClient(
+                url=config["url"],
+                api_key=config.get("api_key")
+            )
+        else:
+            # Host/port-based config (local)
+            _qdrant_client = QdrantClient(
+                host=config.get("host", "localhost"),
+                port=config.get("port", 6333)
+            )
+        
+        logger.info("✅ Qdrant client initialized for index management")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to setup Qdrant client: {e}")
+        _qdrant_client = None
+        return False
+
+
+def _ensure_qdrant_indexes():
+    """Ensure required indexes exist in Qdrant"""
+    global _indexes_created, _qdrant_client
+    
+    if _indexes_created or not _qdrant_client:
+        return
+    
+    try:
+        from qdrant_client.models import PayloadSchemaType
+        
+        config = _get_qdrant_config()
+        collection_name = config.get("collection_name", "openmemory")
+        
+        # Check if collection exists
+        try:
+            collections = _qdrant_client.get_collections()
+            collection_exists = any(col.name == collection_name for col in collections.collections)
+            
+            if not collection_exists:
+                logger.info(f"Collection '{collection_name}' doesn't exist yet - indexes will be created when first memory is added")
+                return
+            
+        except Exception as e:
+            logger.warning(f"Could not check collections: {e}")
+            return
+        
+        # Create index for user_id field
+        try:
+            _qdrant_client.create_payload_index(
+                collection_name=collection_name,
+                field_name="user_id",
+                field_schema=PayloadSchemaType.KEYWORD
+            )
+            logger.info("✅ Created index for user_id field")
+            
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                logger.info("ℹ️ Index for user_id already exists")
+            else:
+                logger.warning(f"⚠️ Could not create user_id index: {e}")
+        
+        # Create index for app_id field (if used)
+        try:
+            _qdrant_client.create_payload_index(
+                collection_name=collection_name,
+                field_name="app_id", 
+                field_schema=PayloadSchemaType.KEYWORD
+            )
+            logger.info("✅ Created index for app_id field")
+            
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                logger.info("ℹ️ Index for app_id already exists")
+            else:
+                logger.warning(f"⚠️ Could not create app_id index: {e}")
+        
+        _indexes_created = True
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to ensure indexes: {e}")
+
+
 def reset_memory_client():
     """Reset the global memory client to force reinitialization with new config."""
-    global _memory_client, _config_hash
+    global _memory_client, _config_hash, _qdrant_client, _indexes_created
     _memory_client = None
     _config_hash = None
+    _qdrant_client = None
+    _indexes_created = False
 
 
 def get_default_memory_config():
@@ -314,7 +390,7 @@ def _test_qdrant_connection():
 
 def get_memory_client(custom_instructions: str = None):
     """
-    Get or initialize the Mem0 client.
+    Get or initialize the Mem0 client with enhanced error handling and index management.
 
     Args:
         custom_instructions: Optional instructions for the memory project.
@@ -325,7 +401,7 @@ def get_memory_client(custom_instructions: str = None):
     Raises:
         Exception: If required API keys are not set or critical configuration is missing.
     """
-    global _memory_client, _config_hash
+    global _memory_client, _config_hash, _qdrant_client
 
     try:
         # Start with default configuration
@@ -385,11 +461,14 @@ def get_memory_client(custom_instructions: str = None):
         print("Parsing environment variables in final config...")
         config = _parse_environment_variables(config)
 
-        # Test Qdrant connection if vector store is configured
+        # Test Qdrant connection and setup client if vector store is configured
         if "vector_store" in config:
             if not _test_qdrant_connection():
                 print("⚠️ Qdrant connection failed, removing vector store from config")
                 config.pop("vector_store", None)
+            else:
+                # Setup Qdrant client for index management
+                _setup_qdrant_client()
 
         # Check if config has changed by comparing hashes
         current_config_hash = _get_config_hash(config)
@@ -400,6 +479,10 @@ def get_memory_client(custom_instructions: str = None):
             try:
                 _memory_client = Memory.from_config(config_dict=config)
                 _config_hash = current_config_hash
+                
+                # Ensure indexes exist if we have Qdrant
+                if "vector_store" in config and _qdrant_client:
+                    _ensure_qdrant_indexes()
                 
                 # Log the configuration mode
                 if "vector_store" in config:
@@ -420,6 +503,14 @@ def get_memory_client(custom_instructions: str = None):
         print(f"Warning: Exception occurred while initializing memory client: {e}")
         print("Server will continue running with limited memory functionality")
         return None
+
+
+def ensure_indexes_after_add():
+    """Ensure indexes exist after adding memories (call this after successful memory add)"""
+    global _qdrant_client, _indexes_created
+    
+    if _qdrant_client and not _indexes_created:
+        _ensure_qdrant_indexes()
 
 
 def get_default_user_id():
