@@ -6,7 +6,7 @@ set -e  # Exit on any error
 echo "🚀 Starting OpenMemory build process..."
 
 # Navigate to API directory
-cd openmemory/api || cd api || {
+cd api || cd api || {
     echo "❌ Could not find API directory"
     exit 1
 }
