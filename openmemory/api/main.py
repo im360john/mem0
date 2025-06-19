@@ -8,6 +8,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.models import User, App
 from uuid import uuid4
 from app.config import USER_ID, DEFAULT_APP_ID
+import os
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pathlib import Path
+
+VECTOR_STORE_CONFIG = {
+    "provider": "pgvector",
+    "config": {
+        "url": os.getenv("DATABASE_URL"),
+        "collection_name": "memories"
+    }
+}
+
+
 
 app = FastAPI(title="OpenMemory API")
 
@@ -69,6 +83,26 @@ def create_default_app():
         db.commit()
     finally:
         db.close()
+
+# Serve static files
+if Path("static").exists():
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/")
+async def serve_ui():
+    return FileResponse("static/index.html")
+
+@app.get("/{path:path}")
+async def serve_ui_routes(path: str):
+    file_path = Path(f"static/{path}")
+    if file_path.exists() and file_path.is_file():
+        return FileResponse(file_path)
+    return FileResponse("static/index.html")
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "vector_store": "pgvector"}
+
 
 # Create default user on startup
 create_default_user()
