@@ -1,4 +1,4 @@
-import datetime
+from sqlalchemy import textimport datetime
 import os
 import logging
 from pathlib import Path
@@ -195,13 +195,22 @@ async def health_check():
     try:
         # Test database connection
         db = SessionLocal()
-        db.execute("SELECT 1")
+        db.execute(text("SELECT 1"))
         db.close()
+        
+        # Check memory service status
+        try:
+            from app.memory import get_memory_client
+            memory_client = get_memory_client()
+            memory_status = "initialized" if memory_client else "fallback_mode"
+        except Exception as e:
+            memory_status = f"error: {str(e)}"
         
         return {
             "status": "healthy",
             "database": "postgresql" if "postgresql" in os.getenv("DATABASE_URL", "") else "unknown",
-            "vector_store": "pgvector",
+            "vector_store": "qdrant_cloud",
+            "memory_service": memory_status,
             "static_files": has_static_files,
             "timestamp": datetime.datetime.now(datetime.UTC).isoformat()
         }
