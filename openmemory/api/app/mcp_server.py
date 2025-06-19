@@ -36,6 +36,10 @@ from qdrant_client import models as qdrant_models
 # Load environment variables
 load_dotenv()
 
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Initialize MCP
 mcp = FastMCP("mem0-mcp-server")
 
@@ -43,9 +47,14 @@ mcp = FastMCP("mem0-mcp-server")
 def get_memory_client_safe():
     """Get memory client with error handling. Returns None if client cannot be initialized."""
     try:
-        return get_memory_client()
+        client = get_memory_client()
+        if client:
+            # Ensure indexes exist after getting client
+            from app.memory import ensure_indexes_after_add
+            ensure_indexes_after_add()
+        return client
     except Exception as e:
-        logging.warning(f"Failed to get memory client: {e}")
+        logger.warning(f"Failed to get memory client: {e}")
         return None
 
 # Context variables for user_id and client_name
@@ -64,14 +73,18 @@ async def add_memories(text: str) -> str:
     client_name = client_name_var.get(None)
 
     if not uid:
-        return "Error: user_id not provided"
+        return json.dumps({"error": "user_id not provided", "success": False})
     if not client_name:
-        return "Error: client_name not provided"
+        return json.dumps({"error": "client_name not provided", "success": False})
+    if not text or not text.strip():
+        return json.dumps({"error": "text is required and cannot be empty", "success": False})
+
+    logger.info(f"🔍 Adding memory for user {uid}: '{text[:50]}...'")
 
     # Get memory client safely
     memory_client = get_memory_client_safe()
     if not memory_client:
-        return "Error: Memory system is currently unavailable. Please try again later."
+        return json.dumps({"error": "Memory system is currently unavailable. Please try again later.", "success": False})
 
     try:
         db = SessionLocal()
@@ -81,45 +94,71 @@ async def add_memories(text: str) -> str:
 
             # Check if app is active
             if not app.is_active:
-                return f"Error: App {app.name} is currently paused on OpenMemory. Cannot create new memories."
+                return json.dumps({
+                    "error": f"App {app.name} is currently paused on OpenMemory. Cannot create new memories.", 
+                    "success": False
+                })
 
-            response = memory_client.add(text,
-                                         user_id=uid,
-                                         metadata={
-                                            "source_app": "openmemory",
-                                            "mcp_client": client_name,
-                                        })
+            # Add enhanced metadata
+            enhanced_metadata = {
+                "user_id": uid,  # Ensure user_id is in metadata for filtering
+                "source_app": "openmemory",
+                "mcp_client": client_name,
+                "timestamp": datetime.datetime.now(datetime.UTC).isoformat()
+            }
+
+            # Add memory
+            response = memory_client.add(
+                messages=[{"role": "user", "content": text}],
+                user_id=uid,
+                metadata=enhanced_metadata
+            )
+
+            logger.info(f"✅ Memory client response: {response}")
+            logger.info(f"✅ Response type: {type(response)}")
 
             # Process the response and update database
+            memories_added = []
+            
             if isinstance(response, dict) and 'results' in response:
+                # Handle Mem0 response format with results array
                 for result in response['results']:
-                    memory_id = uuid.UUID(result['id'])
+                    memory_id = uuid.UUID(result['id']) if 'id' in result else uuid.uuid4()
                     memory = db.query(Memory).filter(Memory.id == memory_id).first()
 
-                    if result['event'] == 'ADD':
+                    if result.get('event') == 'ADD':
                         if not memory:
                             memory = Memory(
                                 id=memory_id,
                                 user_id=user.id,
                                 app_id=app.id,
-                                content=result['memory'],
-                                state=MemoryState.active
+                                content=result.get('memory', text),
+                                state=MemoryState.active,
+                                created_at=datetime.datetime.now(datetime.UTC)
                             )
                             db.add(memory)
                         else:
                             memory.state = MemoryState.active
-                            memory.content = result['memory']
+                            memory.content = result.get('memory', text)
+                            memory.updated_at = datetime.datetime.now(datetime.UTC)
 
                         # Create history entry
                         history = MemoryStatusHistory(
                             memory_id=memory_id,
                             changed_by=user.id,
                             old_state=MemoryState.deleted if memory else None,
-                            new_state=MemoryState.active
+                            new_state=MemoryState.active,
+                            changed_at=datetime.datetime.now(datetime.UTC)
                         )
                         db.add(history)
+                        
+                        memories_added.append({
+                            "id": str(memory_id),
+                            "content": result.get('memory', text),
+                            "event": "ADD"
+                        })
 
-                    elif result['event'] == 'DELETE':
+                    elif result.get('event') == 'DELETE':
                         if memory:
                             memory.state = MemoryState.deleted
                             memory.deleted_at = datetime.datetime.now(datetime.UTC)
@@ -128,33 +167,125 @@ async def add_memories(text: str) -> str:
                                 memory_id=memory_id,
                                 changed_by=user.id,
                                 old_state=MemoryState.active,
-                                new_state=MemoryState.deleted
+                                new_state=MemoryState.deleted,
+                                changed_at=datetime.datetime.now(datetime.UTC)
                             )
                             db.add(history)
+                            
+                            memories_added.append({
+                                "id": str(memory_id),
+                                "content": result.get('memory', text),
+                                "event": "DELETE"
+                            })
 
                 db.commit()
+                
+                logger.info(f"✅ Successfully processed {len(memories_added)} memory operations")
+                
+                return json.dumps({
+                    "success": True,
+                    "message": f"Successfully processed {len(memories_added)} memory operations",
+                    "memories": memories_added,
+                    "user_id": uid,
+                    "original_response": response
+                })
+                
+            elif isinstance(response, dict):
+                # Handle simple response format
+                memory_id = uuid.uuid4()
+                
+                memory = Memory(
+                    id=memory_id,
+                    user_id=user.id,
+                    app_id=app.id,
+                    content=text,
+                    state=MemoryState.active,
+                    created_at=datetime.datetime.now(datetime.UTC)
+                )
+                db.add(memory)
+                
+                # Create history entry
+                history = MemoryStatusHistory(
+                    memory_id=memory_id,
+                    changed_by=user.id,
+                    old_state=None,
+                    new_state=MemoryState.active,
+                    changed_at=datetime.datetime.now(datetime.UTC)
+                )
+                db.add(history)
+                
+                db.commit()
+                
+                logger.info(f"✅ Successfully added memory with ID {memory_id}")
+                
+                return json.dumps({
+                    "success": True,
+                    "message": "Memory added successfully",
+                    "memory": {
+                        "id": str(memory_id),
+                        "content": text
+                    },
+                    "user_id": uid,
+                    "original_response": response
+                })
+            else:
+                # Handle unexpected response format
+                logger.warning(f"⚠️ Unexpected response format: {type(response)}")
+                
+                # Still create a database entry
+                memory_id = uuid.uuid4()
+                memory = Memory(
+                    id=memory_id,
+                    user_id=user.id,
+                    app_id=app.id,
+                    content=text,
+                    state=MemoryState.active,
+                    created_at=datetime.datetime.now(datetime.UTC)
+                )
+                db.add(memory)
+                db.commit()
+                
+                return json.dumps({
+                    "success": True,
+                    "message": "Memory added successfully (unknown response format)",
+                    "memory": {
+                        "id": str(memory_id),
+                        "content": text
+                    },
+                    "user_id": uid,
+                    "original_response": str(response)
+                })
 
-            return response
         finally:
             db.close()
+            
     except Exception as e:
-        logging.exception(f"Error adding to memory: {e}")
-        return f"Error adding to memory: {e}"
+        logger.exception(f"❌ Error adding memory: {e}")
+        return json.dumps({
+            "error": f"Failed to add memory: {str(e)}",
+            "success": False,
+            "user_id": uid
+        })
 
 
 @mcp.tool(description="Search through stored memories. This method is called EVERYTIME the user asks anything.")
 async def search_memory(query: str) -> str:
     uid = user_id_var.get(None)
     client_name = client_name_var.get(None)
+    
     if not uid:
-        return "Error: user_id not provided"
+        return json.dumps({"error": "user_id not provided", "results": []})
     if not client_name:
-        return "Error: client_name not provided"
+        return json.dumps({"error": "client_name not provided", "results": []})
+    if not query or not query.strip():
+        return json.dumps({"error": "query is required and cannot be empty", "results": []})
+
+    logger.info(f"🔍 Searching memories for user {uid}: '{query}'")
 
     # Get memory client safely
     memory_client = get_memory_client_safe()
     if not memory_client:
-        return "Error: Memory system is currently unavailable. Please try again later."
+        return json.dumps({"error": "Memory system is currently unavailable. Please try again later.", "results": []})
 
     try:
         db = SessionLocal()
@@ -162,97 +293,169 @@ async def search_memory(query: str) -> str:
             # Get or create user and app
             user, app = get_user_and_app(db, user_id=uid, app_id=client_name)
 
-            # Get accessible memory IDs based on ACL
-            user_memories = db.query(Memory).filter(Memory.user_id == user.id).all()
-            accessible_memory_ids = [memory.id for memory in user_memories if check_memory_access_permissions(db, memory, app.id)]
-            
-            conditions = [qdrant_models.FieldCondition(key="user_id", match=qdrant_models.MatchValue(value=uid))]
-            
-            if accessible_memory_ids:
-                # Convert UUIDs to strings for Qdrant
-                accessible_memory_ids_str = [str(memory_id) for memory_id in accessible_memory_ids]
-                conditions.append(qdrant_models.HasIdCondition(has_id=accessible_memory_ids_str))
+            # Try memory client search first
+            try:
+                # Use memory client search with error handling
+                results = memory_client.search(
+                    query=query,
+                    user_id=uid,
+                    limit=10
+                )
+                
+                # Handle different result formats
+                if isinstance(results, dict) and "results" in results:
+                    search_results = results["results"]
+                elif isinstance(results, list):
+                    search_results = results
+                else:
+                    search_results = []
+                
+                logger.info(f"✅ Memory client search found {len(search_results)} results")
+                
+                # Log access for found memories
+                for result in search_results:
+                    if isinstance(result, dict) and 'id' in result:
+                        try:
+                            memory_id = uuid.UUID(result['id'])
+                            access_log = MemoryAccessLog(
+                                memory_id=memory_id,
+                                app_id=app.id,
+                                access_type="search",
+                                metadata_={
+                                    "query": query,
+                                    "score": result.get('score'),
+                                    "method": "memory_client"
+                                }
+                            )
+                            db.add(access_log)
+                        except (ValueError, KeyError) as e:
+                            logger.warning(f"Could not log access for result: {e}")
+                
+                db.commit()
+                
+                return json.dumps({
+                    "results": search_results,
+                    "query": query,
+                    "user_id": uid,
+                    "count": len(search_results),
+                    "method": "memory_client"
+                })
+                
+            except Exception as search_error:
+                logger.warning(f"⚠️ Memory client search failed: {search_error}")
+                
+                # Fallback to manual Qdrant search (your original code)
+                if hasattr(memory_client, 'vector_store') and hasattr(memory_client, 'embedding_model'):
+                    try:
+                        # Get accessible memory IDs based on ACL
+                        user_memories = db.query(Memory).filter(Memory.user_id == user.id).all()
+                        accessible_memory_ids = [memory.id for memory in user_memories if check_memory_access_permissions(db, memory, app.id)]
+                        
+                        conditions = [qdrant_models.FieldCondition(key="user_id", match=qdrant_models.MatchValue(value=uid))]
+                        
+                        if accessible_memory_ids:
+                            # Convert UUIDs to strings for Qdrant
+                            accessible_memory_ids_str = [str(memory_id) for memory_id in accessible_memory_ids]
+                            conditions.append(qdrant_models.HasIdCondition(has_id=accessible_memory_ids_str))
 
-            filters = qdrant_models.Filter(must=conditions)
-            embeddings = memory_client.embedding_model.embed(query, "search")
-            
-            hits = memory_client.vector_store.client.query_points(
-                collection_name=memory_client.vector_store.collection_name,
-                query=embeddings,
-                query_filter=filters,
-                limit=10,
-            )
-
-            # Process search results
-            memories = hits.points
-            memories = [
-                {
-                    "id": memory.id,
-                    "memory": memory.payload["data"],
-                    "hash": memory.payload.get("hash"),
-                    "created_at": memory.payload.get("created_at"),
-                    "updated_at": memory.payload.get("updated_at"),
-                    "score": memory.score,
-                }
-                for memory in memories
-            ]
-
-            # Log memory access for each memory found
-            if isinstance(memories, dict) and 'results' in memories:
-                print(f"Memories: {memories}")
-                for memory_data in memories['results']:
-                    if 'id' in memory_data:
-                        memory_id = uuid.UUID(memory_data['id'])
-                        # Create access log entry
-                        access_log = MemoryAccessLog(
-                            memory_id=memory_id,
-                            app_id=app.id,
-                            access_type="search",
-                            metadata_={
-                                "query": query,
-                                "score": memory_data.get('score'),
-                                "hash": memory_data.get('hash')
-                            }
+                        filters = qdrant_models.Filter(must=conditions)
+                        embeddings = memory_client.embedding_model.embed(query, "search")
+                        
+                        hits = memory_client.vector_store.client.query_points(
+                            collection_name=memory_client.vector_store.collection_name,
+                            query=embeddings,
+                            query_filter=filters,
+                            limit=10,
                         )
-                        db.add(access_log)
-                db.commit()
-            else:
-                for memory in memories:
-                    memory_id = uuid.UUID(memory['id'])
-                    # Create access log entry
-                    access_log = MemoryAccessLog(
-                        memory_id=memory_id,
-                        app_id=app.id,
-                        access_type="search",
-                        metadata_={
+
+                        # Process search results
+                        memories = hits.points
+                        memories = [
+                            {
+                                "id": memory.id,
+                                "memory": memory.payload["data"],
+                                "hash": memory.payload.get("hash"),
+                                "created_at": memory.payload.get("created_at"),
+                                "updated_at": memory.payload.get("updated_at"),
+                                "score": memory.score,
+                            }
+                            for memory in memories
+                        ]
+
+                        # Log memory access for each memory found
+                        for memory in memories:
+                            if 'id' in memory:
+                                try:
+                                    memory_id = uuid.UUID(memory['id'])
+                                    access_log = MemoryAccessLog(
+                                        memory_id=memory_id,
+                                        app_id=app.id,
+                                        access_type="search",
+                                        metadata_={
+                                            "query": query,
+                                            "score": memory.get('score'),
+                                            "hash": memory.get('hash'),
+                                            "method": "direct_qdrant"
+                                        }
+                                    )
+                                    db.add(access_log)
+                                except (ValueError, KeyError) as e:
+                                    logger.warning(f"Could not log access for memory: {e}")
+                        
+                        db.commit()
+                        
+                        logger.info(f"✅ Direct Qdrant search found {len(memories)} results")
+                        
+                        return json.dumps({
+                            "results": memories,
                             "query": query,
-                            "score": memory.get('score'),
-                            "hash": memory.get('hash')
-                        }
-                    )
-                    db.add(access_log)
-                db.commit()
-            return json.dumps(memories, indent=2)
+                            "user_id": uid,
+                            "count": len(memories),
+                            "method": "direct_qdrant"
+                        })
+                        
+                    except Exception as qdrant_error:
+                        logger.error(f"❌ Direct Qdrant search also failed: {qdrant_error}")
+                        
+                # Final fallback: return empty results
+                return json.dumps({
+                    "results": [],
+                    "query": query,
+                    "user_id": uid,
+                    "count": 0,
+                    "method": "fallback",
+                    "error": f"Search failed: {str(search_error)}"
+                })
+
         finally:
             db.close()
+            
     except Exception as e:
-        logging.exception(e)
-        return f"Error searching memory: {e}"
+        logger.exception(f"❌ Error in search_memory: {e}")
+        return json.dumps({
+            "error": f"Search failed: {str(e)}",
+            "results": [],
+            "query": query,
+            "user_id": uid
+        })
 
 
 @mcp.tool(description="List all memories in the user's memory")
 async def list_memories() -> str:
     uid = user_id_var.get(None)
     client_name = client_name_var.get(None)
+    
     if not uid:
-        return "Error: user_id not provided"
+        return json.dumps({"error": "user_id not provided", "memories": []})
     if not client_name:
-        return "Error: client_name not provided"
+        return json.dumps({"error": "client_name not provided", "memories": []})
+
+    logger.info(f"📋 Listing memories for user {uid}")
 
     # Get memory client safely
     memory_client = get_memory_client_safe()
     if not memory_client:
-        return "Error: Memory system is currently unavailable. Please try again later."
+        return json.dumps({"error": "Memory system is currently unavailable. Please try again later.", "memories": []})
 
     try:
         db = SessionLocal()
@@ -267,61 +470,85 @@ async def list_memories() -> str:
             # Filter memories based on permissions
             user_memories = db.query(Memory).filter(Memory.user_id == user.id).all()
             accessible_memory_ids = [memory.id for memory in user_memories if check_memory_access_permissions(db, memory, app.id)]
+            
             if isinstance(memories, dict) and 'results' in memories:
                 for memory_data in memories['results']:
                     if 'id' in memory_data:
-                        memory_id = uuid.UUID(memory_data['id'])
-                        if memory_id in accessible_memory_ids:
-                            # Create access log entry
-                            access_log = MemoryAccessLog(
-                                memory_id=memory_id,
-                                app_id=app.id,
-                                access_type="list",
-                                metadata_={
-                                    "hash": memory_data.get('hash')
-                                }
-                            )
-                            db.add(access_log)
-                            filtered_memories.append(memory_data)
-                db.commit()
+                        try:
+                            memory_id = uuid.UUID(memory_data['id'])
+                            if memory_id in accessible_memory_ids:
+                                # Create access log entry
+                                access_log = MemoryAccessLog(
+                                    memory_id=memory_id,
+                                    app_id=app.id,
+                                    access_type="list",
+                                    metadata_={
+                                        "hash": memory_data.get('hash')
+                                    }
+                                )
+                                db.add(access_log)
+                                filtered_memories.append(memory_data)
+                        except ValueError as e:
+                            logger.warning(f"Invalid memory ID: {e}")
             else:
                 for memory in memories:
-                    memory_id = uuid.UUID(memory['id'])
-                    memory_obj = db.query(Memory).filter(Memory.id == memory_id).first()
-                    if memory_obj and check_memory_access_permissions(db, memory_obj, app.id):
-                        # Create access log entry
-                        access_log = MemoryAccessLog(
-                            memory_id=memory_id,
-                            app_id=app.id,
-                            access_type="list",
-                            metadata_={
-                                "hash": memory.get('hash')
-                            }
-                        )
-                        db.add(access_log)
-                        filtered_memories.append(memory)
-                db.commit()
-            return json.dumps(filtered_memories, indent=2)
+                    if isinstance(memory, dict) and 'id' in memory:
+                        try:
+                            memory_id = uuid.UUID(memory['id'])
+                            memory_obj = db.query(Memory).filter(Memory.id == memory_id).first()
+                            if memory_obj and check_memory_access_permissions(db, memory_obj, app.id):
+                                # Create access log entry
+                                access_log = MemoryAccessLog(
+                                    memory_id=memory_id,
+                                    app_id=app.id,
+                                    access_type="list",
+                                    metadata_={
+                                        "hash": memory.get('hash')
+                                    }
+                                )
+                                db.add(access_log)
+                                filtered_memories.append(memory)
+                        except ValueError as e:
+                            logger.warning(f"Invalid memory ID: {e}")
+            
+            db.commit()
+            
+            logger.info(f"✅ Listed {len(filtered_memories)} accessible memories")
+            
+            return json.dumps({
+                "memories": filtered_memories,
+                "user_id": uid,
+                "count": len(filtered_memories)
+            })
+            
         finally:
             db.close()
+            
     except Exception as e:
-        logging.exception(f"Error getting memories: {e}")
-        return f"Error getting memories: {e}"
+        logger.exception(f"❌ Error getting memories: {e}")
+        return json.dumps({
+            "error": f"Failed to get memories: {str(e)}",
+            "memories": [],
+            "user_id": uid
+        })
 
 
 @mcp.tool(description="Delete all memories in the user's memory")
 async def delete_all_memories() -> str:
     uid = user_id_var.get(None)
     client_name = client_name_var.get(None)
+    
     if not uid:
-        return "Error: user_id not provided"
+        return json.dumps({"error": "user_id not provided", "success": False})
     if not client_name:
-        return "Error: client_name not provided"
+        return json.dumps({"error": "client_name not provided", "success": False})
+
+    logger.info(f"🗑️ Deleting all memories for user {uid}")
 
     # Get memory client safely
     memory_client = get_memory_client_safe()
     if not memory_client:
-        return "Error: Memory system is currently unavailable. Please try again later."
+        return json.dumps({"error": "Memory system is currently unavailable. Please try again later.", "success": False})
 
     try:
         db = SessionLocal()
@@ -332,46 +559,64 @@ async def delete_all_memories() -> str:
             user_memories = db.query(Memory).filter(Memory.user_id == user.id).all()
             accessible_memory_ids = [memory.id for memory in user_memories if check_memory_access_permissions(db, memory, app.id)]
 
+            deleted_count = 0
             # delete the accessible memories only
             for memory_id in accessible_memory_ids:
                 try:
                     memory_client.delete(memory_id)
+                    deleted_count += 1
                 except Exception as delete_error:
-                    logging.warning(f"Failed to delete memory {memory_id} from vector store: {delete_error}")
+                    logger.warning(f"Failed to delete memory {memory_id} from vector store: {delete_error}")
 
             # Update each memory's state and create history entries
             now = datetime.datetime.now(datetime.UTC)
             for memory_id in accessible_memory_ids:
                 memory = db.query(Memory).filter(Memory.id == memory_id).first()
-                # Update memory state
-                memory.state = MemoryState.deleted
-                memory.deleted_at = now
+                if memory:
+                    # Update memory state
+                    memory.state = MemoryState.deleted
+                    memory.deleted_at = now
 
-                # Create history entry
-                history = MemoryStatusHistory(
-                    memory_id=memory_id,
-                    changed_by=user.id,
-                    old_state=MemoryState.active,
-                    new_state=MemoryState.deleted
-                )
-                db.add(history)
+                    # Create history entry
+                    history = MemoryStatusHistory(
+                        memory_id=memory_id,
+                        changed_by=user.id,
+                        old_state=MemoryState.active,
+                        new_state=MemoryState.deleted,
+                        changed_at=now
+                    )
+                    db.add(history)
 
-                # Create access log entry
-                access_log = MemoryAccessLog(
-                    memory_id=memory_id,
-                    app_id=app.id,
-                    access_type="delete_all",
-                    metadata_={"operation": "bulk_delete"}
-                )
-                db.add(access_log)
+                    # Create access log entry
+                    access_log = MemoryAccessLog(
+                        memory_id=memory_id,
+                        app_id=app.id,
+                        access_type="delete_all",
+                        metadata_={"operation": "bulk_delete"}
+                    )
+                    db.add(access_log)
 
             db.commit()
-            return "Successfully deleted all memories"
+            
+            logger.info(f"✅ Successfully deleted {len(accessible_memory_ids)} memories")
+            
+            return json.dumps({
+                "success": True,
+                "message": f"Successfully deleted {len(accessible_memory_ids)} memories",
+                "deleted_count": len(accessible_memory_ids),
+                "user_id": uid
+            })
+            
         finally:
             db.close()
+            
     except Exception as e:
-        logging.exception(f"Error deleting memories: {e}")
-        return f"Error deleting memories: {e}"
+        logger.exception(f"❌ Error deleting memories: {e}")
+        return json.dumps({
+            "error": f"Failed to delete memories: {str(e)}",
+            "success": False,
+            "user_id": uid
+        })
 
 
 @mcp_router.get("/{client_name}/sse/{user_id}")
